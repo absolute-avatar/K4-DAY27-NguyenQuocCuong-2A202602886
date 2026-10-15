@@ -39,13 +39,26 @@ def node_fetch_pr(state):
 
 def node_analyze(state):
     console.print("[cyan]→ analyze[/cyan]")
-    llm = get_llm().with_structured_output(PRAnalysis)
+    # Dùng temperature 0 để confidence và các câu hỏi ít dao động
+    # giữa các lần chạy cùng một PR.
+    llm = get_llm(temperature=0.0).with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
             {"role": "system", "content": (
-                "Senior reviewer. Structured output. "
+                "You are a conservative senior PR reviewer. Confidence means the "
+                "review is complete enough to act without human context. "
+                f"Use >={AUTO_APPROVE_THRESHOLD:.2f} only for small, clear, low-risk, "
+                f"well-tested changes; use [{ESCALATE_THRESHOLD:.2f}, "
+                f"{AUTO_APPROVE_THRESHOLD:.2f}) when migration, compatibility, intent, "
+                f"or test questions remain; use <{ESCALATE_THRESHOLD:.2f} for auth, "
+                "crypto, secrets, SQL injection, data-loss risks, or multiple serious "
+                "issues. Finding a serious bug confidently does not justify high confidence. "
                 # TODO: add an instruction: if confidence < 60%, populate escalation_questions
                 # with 2–4 specific, context-rich questions (reference which file/section in the diff).
+                f"When confidence is below {ESCALATE_THRESHOLD:.2f}, populate "
+                "escalation_questions with 2-4 concrete questions. Each question must "
+                "reference the relevant file, function, or diff section and ask for "
+                "missing intent, constraints, or security context."
             )},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
@@ -75,7 +88,18 @@ def node_escalate(state: ReviewState) -> dict:
     #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
     # answers = interrupt({...})
     # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    # Lần gọi đầu sẽ dừng graph và chuyển payload này cho
+    # handle_interrupt(). Sau Command(resume=...), interrupt() trả lại dict answers.
+    answers = interrupt({
+        "kind": "escalation",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "risk_factors": a.risk_factors,
+        "questions": questions,
+    })
+    return {"escalation_answers": answers}
 
 
 def node_synthesize(state: ReviewState) -> dict:
@@ -86,7 +110,39 @@ def node_synthesize(state: ReviewState) -> dict:
     #     containing the original diff + initial analysis + Q&A.
     #   - return {"analysis": refined}
     # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    answers = state.get("escalation_answers") or {}
+    qa = "\n\n".join(f"Q: {question}\nA: {answer}" for question, answer in answers.items())
+    initial_analysis = state["analysis"].model_dump_json(indent=2)
+
+    # Lần gọi thứ hai nhận cả kết quả ban đầu lẫn ngữ cảnh do
+    # reviewer cung cấp, sau đó thay thế state["analysis"] bằng bản mới.
+    llm = get_llm(temperature=0.0).with_structured_output(PRAnalysis)
+    with console.status("[dim]LLM refining review with reviewer answers...[/dim]"):
+        refined = llm.invoke([
+            {
+                "role": "system",
+                "content": (
+                    "You are a senior PR reviewer. Produce a complete, refined "
+                    "PRAnalysis using the reviewer's answers. Treat answers as context, "
+                    "not proof that code defects are fixed. Reassess risks, comments, "
+                    "and confidence, and explain the new confidence concretely."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Original diff:\n{state['pr_diff']}\n\n"
+                    f"Initial analysis:\n{initial_analysis}\n\n"
+                    f"Reviewer Q&A:\n{qa}"
+                ),
+            },
+        ])
+
+    console.print(
+        f"  [green]✓[/green] refined confidence={refined.confidence:.0%}, "
+        f"{len(refined.comments)} comment(s)"
+    )
+    return {"analysis": refined}
 
 
 def node_human_approval(state):
@@ -162,6 +218,10 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     # TODO: wire escalate → synthesize → commit  (commit already → END)
+    # Chỉ sau khi có answers, graph mới phân tích lại và chuyển sang node
+    # có side-effect đăng comment. Không đăng trong node chứa interrupt.
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "commit")
     return g.compile(checkpointer=MemorySaver())
 
 

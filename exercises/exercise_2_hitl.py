@@ -40,10 +40,23 @@ def node_fetch_pr(state: ReviewState) -> dict:
 
 def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
-    llm = get_llm().with_structured_output(PRAnalysis)
+    # Giữ cùng rubric với Exercise 1 để PR được định tuyến nhất quán;
+    # temperature=0.0 giúp confidence ít dao động giữa các lần chạy.
+    llm = get_llm(temperature=0.0).with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
-            {"role": "system", "content": "Senior reviewer. Structured output."},
+            {
+                "role": "system",
+                "content": (
+                    "You are a conservative senior PR reviewer. Confidence means the "
+                    "review is complete enough to act without human context. Use "
+                    ">=0.73 only for small, clear, low-risk, well-tested changes; "
+                    "use 0.58-0.72 when migration, compatibility, intent, or test "
+                    "questions remain; use <0.58 for auth, crypto, secrets, SQL "
+                    "injection, data-loss risks, or multiple serious issues. Finding "
+                    "a serious bug confidently does not justify high confidence."
+                ),
+            },
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.comments)} comment(s)")
@@ -73,7 +86,21 @@ def node_human_approval(state: ReviewState) -> dict:
     # interrupt() returns whatever the caller passes via Command(resume=...).
     # response = interrupt(...)
     # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+    # Lần đầu tới đây, interrupt() lưu checkpoint và trả payload cho
+    # main(). Khi resume, node chạy lại và interrupt() trả về answer.
+    response = interrupt({
+        "kind": "approval_request",
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [comment.model_dump() for comment in a.comments],
+        # Chỉ hiển thị phần đầu để terminal không bị ngập bởi diff dài.
+        "diff_preview": state["pr_diff"][:2000],
+    })
+    return {
+        "human_choice": response["choice"],
+        "human_feedback": response.get("feedback"),
+    }
 
 
 def _render_comment_body(state: ReviewState) -> str:
@@ -100,6 +127,8 @@ def _post(state: ReviewState, label: str) -> str:
 
 def node_commit(state: ReviewState) -> dict:
     console.print("[cyan]→ commit[/cyan]")
+    # Side-effect đăng GitHub comment nằm sau node interrupt. Vì node chứa
+    # interrupt sẽ chạy lại khi resume, cách tách này tránh đăng hai lần.
     if state.get("human_choice") == "approve":
         return {"final_action": _post(state, "committed")}
     console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
@@ -134,7 +163,9 @@ def build_graph():
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
     # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+    # Interrupt chỉ có thể resume khi graph có checkpointer. MemorySaver phù
+    # hợp cho bài này; trạng thái sẽ mất khi tiến trình kết thúc.
+    return g.compile(checkpointer=MemorySaver())
 
 
 def prompt_human(payload: dict) -> dict:
@@ -180,6 +211,14 @@ def main() -> None:
     #   - resume with app.invoke(Command(resume=<answer>), cfg)
     # while "__interrupt__" in result:
     #     ...
+    # Dùng while thay vì if để luồng vẫn đúng nếu graph có thêm
+    # một interrupt khác sau lần resume đầu tiên.
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        answer = prompt_human(payload)
+        # Bắt buộc dùng lại cfg có cùng thread_id; nếu không LangGraph
+        # sẽ coi đây là một phiên mới thay vì tiếp tục checkpoint cũ.
+        result = app.invoke(Command(resume=answer), cfg)
 
     console.rule("Done")
     console.print(result.get("final_action"))
